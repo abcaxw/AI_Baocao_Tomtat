@@ -1,12 +1,13 @@
 import os
-from typing import Optional
+from typing import Optional, Dict
 import anthropic
 from openai import OpenAI
+import tiktoken
 
 
 class AISummarizer:
     """
-    AI Summarizer với nhiều backend
+    AI Summarizer với tracking tokens và chi phí
     """
 
     def __init__(self, provider: str = "openai"):
@@ -17,14 +18,27 @@ class AISummarizer:
         self.provider = provider
 
         if provider == "openai":
-            # SET KEY TRỰC TIẾP
-            self.client = OpenAI(api_key="")
+            self.client = OpenAI(api_key="")  # SET KEY TRỰC TIẾP
             self.model = "gpt-4o-mini"
+            # Initialize tokenizer for counting
+            try:
+                self.tokenizer = tiktoken.encoding_for_model(self.model)
+            except:
+                self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
         elif provider == "claude":
-            # Nếu dùng Claude, set key ở đây
             self.client = anthropic.Anthropic(api_key="your-claude-key-here")
             self.model = "claude-3-5-sonnet-20241022"
+            self.tokenizer = None  # Claude doesn't need local tokenizer
+
+    def count_tokens(self, text: str) -> int:
+        """Đếm số token trong text"""
+        if self.provider == "openai" and self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        elif self.provider == "claude":
+            # Ước tính cho Claude (1 token ≈ 4 chars)
+            return len(text) // 4
+        return 0
 
     def summarize(
             self,
@@ -32,21 +46,33 @@ class AISummarizer:
             question: str,
             question_type: str,
             max_tokens: int = 4000
-    ) -> str:
+    ) -> Dict:
         """
         Tóm tắt văn bản theo câu hỏi
+
+        Returns:
+            Dict với keys: answer, usage, cost_info
         """
 
-        # Tạo prompt dựa trên question_type
+        # Tạo prompt
         system_prompt = self._build_system_prompt(question_type)
         user_prompt = self._build_user_prompt(document_content, question, question_type)
 
+        # Count input tokens
+        input_tokens_estimate = self.count_tokens(system_prompt + user_prompt)
+
         if self.provider == "openai":
-            return self._summarize_openai(system_prompt, user_prompt, max_tokens)
+            result = self._summarize_openai(system_prompt, user_prompt, max_tokens)
         elif self.provider == "claude":
-            return self._summarize_claude(system_prompt, user_prompt, max_tokens)
+            result = self._summarize_claude(system_prompt, user_prompt, max_tokens)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
+
+        # Add input token estimate if not provided by API
+        if "input_tokens" not in result["usage"]:
+            result["usage"]["input_tokens"] = input_tokens_estimate
+
+        return result
 
     def _build_system_prompt(self, question_type: str) -> str:
         """Tạo system prompt theo loại câu hỏi"""
@@ -125,8 +151,6 @@ YÊU CẦU FORMAT:
 
     def _build_user_prompt(self, document: str, question: str, question_type: str) -> str:
         """Tạo user prompt"""
-
-        # Truncate document nếu quá dài (giữ trong context limit)
         max_doc_length = 15000
         if len(document) > max_doc_length:
             document = document[:max_doc_length] + "\n\n[...Tài liệu còn tiếp...]"
@@ -142,8 +166,8 @@ LOẠI CÂU HỎI: {question_type}
 
 Hãy trả lời câu hỏi dựa trên nội dung tài liệu theo đúng format yêu cầu."""
 
-    def _summarize_openai(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
-        """Tóm tắt bằng OpenAI"""
+    def _summarize_openai(self, system_prompt: str, user_prompt: str, max_tokens: int) -> Dict:
+        """Tóm tắt bằng OpenAI với tracking"""
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -154,12 +178,25 @@ Hãy trả lời câu hỏi dựa trên nội dung tài liệu theo đúng forma
                 max_tokens=max_tokens,
                 temperature=0.3
             )
-            return response.choices[0].message.content
+
+            # Extract usage information
+            usage = response.usage
+
+            return {
+                "answer": response.choices[0].message.content,
+                "usage": {
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens
+                },
+                "model": self.model,
+                "provider": "openai"
+            }
         except Exception as e:
             raise Exception(f"OpenAI API error: {str(e)}")
 
-    def _summarize_claude(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
-        """Tóm tắt bằng Claude"""
+    def _summarize_claude(self, system_prompt: str, user_prompt: str, max_tokens: int) -> Dict:
+        """Tóm tắt bằng Claude với tracking"""
         try:
             message = self.client.messages.create(
                 model=self.model,
@@ -170,14 +207,26 @@ Hãy trả lời câu hỏi dựa trên nội dung tài liệu theo đúng forma
                     {"role": "user", "content": user_prompt}
                 ]
             )
-            return message.content[0].text
+
+            # Extract usage from response
+            usage = message.usage
+
+            return {
+                "answer": message.content[0].text,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.input_tokens + usage.output_tokens
+                },
+                "model": self.model,
+                "provider": "claude"
+            }
         except Exception as e:
             raise Exception(f"Claude API error: {str(e)}")
 
 
 # Test summarizer
 if __name__ == "__main__":
-    # Cần set OPENAI_API_KEY hoặc ANTHROPIC_API_KEY trong environment
     summarizer = AISummarizer(provider="openai")
 
     test_doc = """
@@ -187,11 +236,15 @@ if __name__ == "__main__":
 
     test_question = "Tóm tắt mục tiêu chính đến năm 2030"
 
-    summary = summarizer.summarize(
+    result = summarizer.summarize(
         document_content=test_doc,
         question=test_question,
         question_type="muc_tieu"
     )
 
     print("=== SUMMARY ===")
-    print(summary)
+    print(result["answer"])
+    print("\n=== USAGE ===")
+    print(f"Input tokens: {result['usage']['input_tokens']}")
+    print(f"Output tokens: {result['usage']['output_tokens']}")
+    print(f"Total tokens: {result['usage']['total_tokens']}")
